@@ -63,9 +63,8 @@ class Qual(object):
     def __repr__(self):
         if self.is_list_operator:
             value = '%s(%s)' % (
-                    'ANY' if self.list_any_or_all == ANY
-                          else 'ALL',
-                    self.value)
+                'ANY' if self.list_any_or_all == ANY else 'ALL',
+                self.value)
             operator = self.operator[0]
         else:
             value = self.value
@@ -135,9 +134,11 @@ class ForeignDataWrapper(object):
 
     @property
     def rowid_column(self):
-        """Returns a column name which will act as a rowid column, for delete/update
-        operations. This can be either an existing column name, or a made-up one.
-        This column name should be subsequently present in every returned resultset.
+        """Returns a column name which will act as a rowid column,
+        for delete/update operations. This can be either an existing column
+        name, or a made-up one.
+        This column name should be subsequently present in every
+        returned resultset.
         """
         raise NotImplementedError("This FDW does not support the writable API")
 
@@ -165,11 +166,24 @@ class ForeignDataWrapper(object):
     def end_modify(self):
         pass
 
+    def begin(self, serializable):
+        pass
+
+    def sub_begin(self, level):
+        pass
+
+    def sub_rollback(self, level):
+        pass
+
+    def sub_commit(self, level):
+        pass
+
 
 class TransactionAwareForeignDataWrapper(ForeignDataWrapper):
 
     def __init__(self, fdw_options, fdw_columns):
-        super(TransactionAwareForeignDataWrapper, self).__init__(fdw_options, fdw_columns)
+        super(TransactionAwareForeignDataWrapper, self).__init__(
+            fdw_options, fdw_columns)
         self._init_transaction_state()
 
     def _init_transaction_state(self):
@@ -179,7 +193,8 @@ class TransactionAwareForeignDataWrapper(ForeignDataWrapper):
         self.current_transaction_state.append(('insert', values))
 
     def update(self, oldvalues, newvalues):
-        self.current_transaction_state.append(('update', (oldvalues, newvalues)))
+        self.current_transaction_state.append(
+            ('update', (oldvalues, newvalues)))
 
     def delete(self, oldvalues):
         self.current_transaction_state.append(('delete', oldvalues))
@@ -204,7 +219,7 @@ def _resolve_name(name, package, level):
             dot = package.rindex('.', 0, dot)
         except ValueError:
             raise ValueError("attempted relative import beyond top-level "
-                              "package")
+                             "package")
     return "%s.%s" % (package[:dot], name)
 
 

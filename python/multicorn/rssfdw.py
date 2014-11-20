@@ -7,8 +7,32 @@ try:
     from urllib.request import urlopen
 except ImportError:
     from urllib import urlopen
-from logging import ERROR
+from logging import ERROR, WARNING
 from multicorn.utils import log_to_postgres
+import json
+
+
+def element_to_dict(element):
+    """
+    This method takes a lxml element and return a json string containing
+    the element attributes and a text key and a child node.
+    >>> test = lambda x: sorted([(k, sorted(v.items())) if isinstance(v, dict) else (k, [sorted(e.items()) for e in v]) if isinstance(v, list) else (k, v) for k, v in element_to_dict(etree.fromstring(x)).items()])
+    >>> test('<t a1="v1"/>')
+    [('attributes', {'a1': 'v1'}), ('children', []), ('tag', 't'), ('text', '')]
+
+    >>> test('<t a1="v1">Txt</t>')
+    [('attributes', {'a1': 'v1'}), ('children', []), ('tag', 't'), ('text', 'Txt')]
+
+    >>> test('<t>Txt<s1 a1="v1">Sub1</s1>Txt2<s2 a2="v2">Sub2</s2>Txt3</t>')
+    [('attributes', {}), ('children', [[('attributes', {'a1': 'v1'}), ('children', []), ('tag', 's1'), ('text', 'Sub1')], [('attributes', {'a2': 'v2'}), ('children', []), ('tag', 's2'), ('text', 'Sub2')]]), ('tag', 't'), ('text', 'Txt')]
+
+"""
+    return {
+        'tag': etree.QName(element.tag).localname,
+        'text': element.text or '',
+        'attributes': dict(element.attrib),
+        'children': [element_to_dict(e) for e in element]
+    }
 
 
 class RssFdw(ForeignDataWrapper):
@@ -35,15 +59,33 @@ class RssFdw(ForeignDataWrapper):
             log_to_postgres("You MUST set an url when creating the table!",
                             ERROR)
         self.columns = columns
+        self.default_namespace_prefix = options.pop(
+            'default_namespace_prefix', None)
+        self.item_root = options.pop('item_root', 'item')
 
-    def make_item_from_xml(self, xml_elem, namespaces):
+    def get_namespaces(self, xml):
+        ns = dict(xml.nsmap)
+        if None in ns:
+            ns[self.default_namespace_prefix] = ns.pop(None)
+        return ns
+
+    def make_item_from_xml(self, xml_elem):
         """Internal method used for parsing item xml element from the
         columns definition."""
         item = {}
-        for prop in self.columns:
-            value = xml_elem.xpath(prop, namespaces=namespaces)
+        for prop, column in self.columns.items():
+            value = xml_elem.xpath(
+                prop, namespaces=self.get_namespaces(xml_elem))
             if value:
-                item[prop] = value[0].text
+                if column.type_name.startswith('json'):
+                    item[prop] = json.dumps([
+                        element_to_dict(val) for val in value])
+                # There should be a better way
+                # oid is 1009 ?
+                elif column.type_name.endswith('[]'):
+                    item[prop] = [elem.text for elem in value]
+                else:
+                    item[prop] = getattr(value[0], 'text', value[0])
         return item
 
     def execute(self, quals, columns):
@@ -55,10 +97,13 @@ class RssFdw(ForeignDataWrapper):
                     return values
         try:
             xml = etree.fromstring(urlopen(self.url).read())
-            items = [self.make_item_from_xml(elem, xml.nsmap)
-                     for elem in xml.xpath('//item')]
+            items = [self.make_item_from_xml(elem)
+                     for elem in xml.xpath(
+                         '//%s' % self.item_root,
+                         namespaces=self.get_namespaces(xml))]
             self.cache = (datetime.now(), items)
             return items
         except etree.ParseError:
             log_to_postgres("Malformed xml, returning nothing")
-            return
+        except IOError:
+            log_to_postgres("Cannot retrieve '%s'" % self.url, WARNING)

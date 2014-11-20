@@ -87,6 +87,8 @@ ALTER FOREIGN TABLE testmulticorn alter test1 type integer;
 
 select * from testmulticorn limit 1;
 
+select * from testmulticorn where test1 = 0;
+
 ALTER FOREIGN TABLE testmulticorn options (drop test_type);
 
 -- Test operations with bytea
@@ -104,5 +106,9 @@ ALTER FOREIGN TABLE testmulticorn options (set test_type 'iter_none');
 
 select * from testmulticorn;
 
+ALTER FOREIGN TABLE testmulticorn add test3 money;
+
+SELECT * from testmulticorn where test3 = 12::money;
+SELECT * from testmulticorn where test1 = '12 €';
 
 DROP EXTENSION multicorn cascade;

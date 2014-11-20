@@ -3,9 +3,17 @@
 from . import ForeignDataWrapper
 from .utils import log_to_postgres, ERROR, WARNING, DEBUG
 from sqlalchemy import create_engine
+from sqlalchemy.engine.url import make_url, URL
 from sqlalchemy.sql import select, operators as sqlops, and_
+# Handle the sqlalchemy 0.8 / 0.9 changes
+try:
+    from sqlalchemy.sql import sqltypes
+except ImportError:
+    from sqlalchemy import types as sqltypes
+
 from sqlalchemy.schema import Table, Column, MetaData
-from sqlalchemy.dialects.postgresql.base import ischema_names
+from sqlalchemy.dialects.postgresql.base import ARRAY, ischema_names
+import re
 import operator
 
 
@@ -48,22 +56,39 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     Accepted options:
 
     db_url      --  the sqlalchemy connection string.
+    schema      --  (optional) schema name to qualify table name with
     tablename   --  the table name in the remote database.
 
     """
 
     def __init__(self, fdw_options, fdw_columns):
         super(SqlAlchemyFdw, self).__init__(fdw_options, fdw_columns)
-        if 'db_url' not in fdw_options:
-            log_to_postgres('The db_url parameter is required', ERROR)
         if 'tablename' not in fdw_options:
             log_to_postgres('The tablename parameter is required', ERROR)
-        self.engine = create_engine(fdw_options.get('db_url'))
         self.metadata = MetaData()
+        if fdw_options.get('db_url'):
+            url = make_url(fdw_options.get('db_url'))
+        else:
+            if 'drivername' not in fdw_options:
+                log_to_postgres('Either a db_url, or drivername and other '
+                                'connection infos are needed', ERROR)
+            url = URL(fdw_options['drivername'])
+        for param in ('username', 'password', 'host',
+                      'database', 'port'):
+            if param in fdw_options:
+                setattr(url, param, fdw_options[param])
+        self.engine = create_engine(url)
+        schema = fdw_options['schema'] if 'schema' in fdw_options else None
         tablename = fdw_options['tablename']
-        self.table = Table(tablename, self.metadata,
-                           *[Column(col.column_name, ischema_names[col.type_name])
-                             for col in fdw_columns.values()])
+        sqlacols = []
+        for col in fdw_columns.values():
+            col_type = self._get_column_type(col.type_name)
+            sqlacols.append(Column(col.column_name, col_type))
+        self.table = Table(tablename, self.metadata, schema=schema,
+                           *sqlacols)
+        self.transaction = None
+        self._connection = None
+        self._row_id_column = fdw_options.get('primary_key', None)
 
     def execute(self, quals, columns):
         """
@@ -81,8 +106,126 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                                 WARNING)
         if clauses:
             statement = statement.where(and_(*clauses))
-        columns = [self.table.c[col] for col in columns]
+        if columns:
+            columns = [self.table.c[col] for col in columns]
+        else:
+            columns = self.table.c
         statement = statement.with_only_columns(columns)
         log_to_postgres(str(statement), DEBUG)
-        for item in self.engine.execute(statement):
+        rs = (self.connection
+              .execution_options(stream_results=True)
+              .execute(statement))
+        for item in rs:
             yield dict(item)
+
+    @property
+    def connection(self):
+        if self._connection is None:
+            self._connection = self.engine.connect()
+        return self._connection
+
+    def begin(self, serializable):
+        self.transaction = self.connection.begin()
+
+    def pre_commit(self):
+        if self.transaction is not None:
+            self.transaction.commit()
+            self.transaction = None
+
+    def commit(self):
+        # Pre-commit hook does this on 9.3
+        if self.transaction is not None:
+            self.transaction.commit()
+            self.transaction = None
+
+    def rollback(self):
+        if self.transaction is not None:
+            self.transaction.rollback()
+            self.transaction = None
+
+    @property
+    def rowid_column(self):
+        if self._row_id_column is None:
+            log_to_postgres(
+                'You need to declare a primary key option in order '
+                'to use the write features')
+        return self._row_id_column
+
+    def insert(self, values):
+        self.connection.execute(self.table.insert(values=values))
+
+    def update(self, rowid, newvalues):
+        self.connection.execute(
+            self.table.update()
+            .where(self.table.c[self._row_id_column] == rowid)
+            .values(newvalues))
+
+    def delete(self, rowid):
+        self.connection.execute(
+            self.table.delete()
+            .where(self.table.c[self._row_id_column] == rowid))
+
+    def _get_column_type(self, format_type):
+        """Blatant ripoff from PG_Dialect.get_column_info"""
+        # strip (*) from character varying(5), timestamp(5)
+        # with time zone, geometry(POLYGON), etc.
+        attype = re.sub(r'\(.*\)', '', format_type)
+
+        # strip '[]' from integer[], etc.
+        attype = re.sub(r'\[\]', '', attype)
+
+        is_array = format_type.endswith('[]')
+        charlen = re.search('\(([\d,]+)\)', format_type)
+        if charlen:
+            charlen = charlen.group(1)
+        args = re.search('\((.*)\)', format_type)
+        if args and args.group(1):
+            args = tuple(re.split('\s*,\s*', args.group(1)))
+        else:
+            args = ()
+        kwargs = {}
+
+        if attype == 'numeric':
+            if charlen:
+                prec, scale = charlen.split(',')
+                args = (int(prec), int(scale))
+            else:
+                args = ()
+        elif attype == 'double precision':
+            args = (53, )
+        elif attype == 'integer':
+            args = ()
+        elif attype in ('timestamp with time zone',
+                        'time with time zone'):
+            kwargs['timezone'] = True
+            if charlen:
+                kwargs['precision'] = int(charlen)
+            args = ()
+        elif attype in ('timestamp without time zone',
+                        'time without time zone', 'time'):
+            kwargs['timezone'] = False
+            if charlen:
+                kwargs['precision'] = int(charlen)
+            args = ()
+        elif attype == 'bit varying':
+            kwargs['varying'] = True
+            if charlen:
+                args = (int(charlen),)
+            else:
+                args = ()
+        elif attype in ('interval', 'interval year to month',
+                        'interval day to second'):
+            if charlen:
+                kwargs['precision'] = int(charlen)
+            args = ()
+        elif charlen:
+            args = (int(charlen),)
+
+        coltype = ischema_names.get(attype, None)
+        if coltype:
+            coltype = coltype(*args, **kwargs)
+            if is_array:
+                coltype = ARRAY(coltype)
+        else:
+            coltype = sqltypes.NULLTYPE
+        return coltype

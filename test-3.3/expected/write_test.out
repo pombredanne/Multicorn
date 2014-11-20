@@ -8,21 +8,28 @@ CREATE foreign table testmulticorn (
     test2 character varying
 ) server multicorn_srv options (
     option1 'option1',
-    test_type 'nowrite'
+    test_type 'nowrite',
+    tx_hook 'true'
 );
 insert into testmulticorn(test1, test2) VALUES ('test', 'test2');
-NOTICE:  [('option1', 'option1'), ('test_type', 'nowrite'), ('usermapping', 'test')]
+NOTICE:  [('option1', 'option1'), ('test_type', 'nowrite'), ('tx_hook', 'true'), ('usermapping', 'test')]
 NOTICE:  [('test1', 'character varying'), ('test2', 'character varying')]
+NOTICE:  BEGIN
+NOTICE:  ROLLBACK
 ERROR:  Error in python: NotImplementedError
 DETAIL:  This FDW does not support the writable API
 update testmulticorn set test1 = 'test';
+NOTICE:  BEGIN
 NOTICE:  []
 NOTICE:  ['test1', 'test2']
+NOTICE:  ROLLBACK
 ERROR:  Error in python: NotImplementedError
 DETAIL:  This FDW does not support the writable API
 delete from testmulticorn where test2 = 'test2 2 0';
+NOTICE:  BEGIN
 NOTICE:  [test2 = test2 2 0]
 NOTICE:  ['test1', 'test2']
+NOTICE:  ROLLBACK
 ERROR:  Error in python: NotImplementedError
 DETAIL:  This FDW does not support the writable API
 CREATE foreign table testmulticorn_write (
@@ -31,13 +38,18 @@ CREATE foreign table testmulticorn_write (
 ) server multicorn_srv options (
     option1 'option1',
     row_id_column 'test1',
-	test_type 'returning'
+	test_type 'returning',
+    tx_hook 'true'
 );
 insert into testmulticorn_write(test1, test2) VALUES ('test', 'test2');
-NOTICE:  [('option1', 'option1'), ('row_id_column', 'test1'), ('test_type', 'returning'), ('usermapping', 'test')]
+NOTICE:  [('option1', 'option1'), ('row_id_column', 'test1'), ('test_type', 'returning'), ('tx_hook', 'true'), ('usermapping', 'test')]
 NOTICE:  [('test1', 'character varying'), ('test2', 'character varying')]
+NOTICE:  BEGIN
 NOTICE:  INSERTING: [('test1', 'test'), ('test2', 'test2')]
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
 update testmulticorn_write set test1 = 'test' where test1 ilike 'test1 3%';
+NOTICE:  BEGIN
 NOTICE:  [test1 ~~* test1 3%]
 NOTICE:  ['test1', 'test2']
 NOTICE:  UPDATING: test1 3 1 with [('test1', 'test'), ('test2', 'test2 1 1')]
@@ -47,19 +59,28 @@ NOTICE:  UPDATING: test1 3 10 with [('test1', 'test'), ('test2', 'test2 1 10')]
 NOTICE:  UPDATING: test1 3 13 with [('test1', 'test'), ('test2', 'test2 1 13')]
 NOTICE:  UPDATING: test1 3 16 with [('test1', 'test'), ('test2', 'test2 1 16')]
 NOTICE:  UPDATING: test1 3 19 with [('test1', 'test'), ('test2', 'test2 1 19')]
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
 delete from testmulticorn_write where test2 = 'test2 2 0';
+NOTICE:  BEGIN
 NOTICE:  [test2 = test2 2 0]
 NOTICE:  ['test1', 'test2']
 NOTICE:  DELETING: test1 1 0
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
 -- Test returning
 insert into testmulticorn_write(test1, test2) VALUES ('test', 'test2') RETURNING test1;
+NOTICE:  BEGIN
 NOTICE:  INSERTING: [('test1', 'test'), ('test2', 'test2')]
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
      test1      
 ----------------
  INSERTED: test
 (1 row)
 
 update testmulticorn_write set test1 = 'test' where test1 ilike 'test1 3%' RETURNING test1;
+NOTICE:  BEGIN
 NOTICE:  [test1 ~~* test1 3%]
 NOTICE:  ['test1', 'test2']
 NOTICE:  UPDATING: test1 3 1 with [('test1', 'test'), ('test2', 'test2 1 1')]
@@ -69,6 +90,8 @@ NOTICE:  UPDATING: test1 3 10 with [('test1', 'test'), ('test2', 'test2 1 10')]
 NOTICE:  UPDATING: test1 3 13 with [('test1', 'test'), ('test2', 'test2 1 13')]
 NOTICE:  UPDATING: test1 3 16 with [('test1', 'test'), ('test2', 'test2 1 16')]
 NOTICE:  UPDATING: test1 3 19 with [('test1', 'test'), ('test2', 'test2 1 19')]
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
      test1     
 ---------------
  UPDATED: test
@@ -81,9 +104,12 @@ NOTICE:  UPDATING: test1 3 19 with [('test1', 'test'), ('test2', 'test2 1 19')]
 (7 rows)
 
 delete from testmulticorn_write where test1 = 'test1 1 0' returning test2, test1;
+NOTICE:  BEGIN
 NOTICE:  [test1 = test1 1 0]
 NOTICE:  ['test1', 'test2']
 NOTICE:  DELETING: test1 1 0
+NOTICE:  PRECOMMIT
+NOTICE:  COMMIT
    test2   |   test1   
 -----------+-----------
  test2 2 0 | test1 1 0

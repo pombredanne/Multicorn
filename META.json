@@ -14,7 +14,7 @@
         },
         "homepage": "http://multicorn.org",
         "bugtracker": {
-            "web": "http://redmine.kozea.fr/projects/multicorn/issues",
+            "web": "https://github.com/Kozea/Multicorn/issues",
             "mailto": "multicorn@librelist.org"
         }
     },
@@ -35,7 +35,7 @@
         }
     },
 
-    "release_status": "testing",
+    "release_status": "stable",
     "generated_by": "Kozea",
     "meta-spec": {
         "version": "1.0.0",

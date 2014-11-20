@@ -1,3 +1,32 @@
+1.1.0:
+    - ldap_fdw:
+       - use the ldap3 module for python3 compatibility (Guillaume Ayoub)
+       - allow types other than varchar (Guillaume Ayoub)
+    - sqlalchemy_fdw: explictly pass "stream_results" options
+    - fix some bugs wrt array handling
+    - Build:
+       - add support for VPATH builds (Markus Wanner, Christoph Berg)
+    - rssfdw:
+       - more flexibility for rss feeds
+1.0.4:
+    - Add support for upcoming AFTER TRIGGERs on foreign tables.
+    - Fix reference counting bug in messages
+    - Add indivual options for sqlalchemy fdw
+    - Fix bugs with refcounting
+    - Fix bug with unary operator
+1.0.3:
+    - Fix bugs with types reflection in sqlalchemyfdw (Thanks to naoshika for
+      reporting it)
+    - Fix bug regarding ARRAY detection
+    - Small cleanups in Py_None reference counting
+    - Better guard against errors during fdw initialization
+1.0.2:
+    - Fix bug when an exception occurs during iteration (Thanks to johnmudd for
+      reporting it)
+    - Add missing PYTHON_LDFLAGS when compiling with PYTHON_OVERRIDE (Thanks to
+      frensley for reporting it)
+1.0.1:
+    - Use rollback/commit hooks on 9.2 too.
 1.0.0:
     - 9.3 writable API support
     - Python3 experimental support

@@ -19,13 +19,25 @@
 #ifndef PG_MULTICORN_H
 #define PG_MULTICORN_H
 
-
 /* Data structures */
+
+typedef struct CacheEntry
+{
+        Oid                     hashkey;
+        PyObject   *value;
+        List       *options;
+        List       *columns;
+        int        xact_depth;
+        /* Keep the "options" and "columns" in a specific context to avoid leaks. */
+        MemoryContext cacheContext;
+}       CacheEntry;
+
 
 typedef struct ConversionInfo
 {
 	char	   *attrname;
 	FmgrInfo   *attinfunc;
+	FmgrInfo   *attoutfunc;
 	Oid			atttypoid;
 	Oid			attioparam;
 	int32		atttypmod;
@@ -90,6 +102,7 @@ typedef struct MulticornConstQual
 {
 	MulticornBaseQual base;
 	Datum		value;
+    bool isnull;
 }	MulticornConstQual;
 
 typedef struct MulticornVarQual
@@ -128,6 +141,11 @@ void getRelSize(MulticornPlanState * state,
 		   int *width);
 
 List	   *pathKeys(MulticornPlanState * state);
+
+CacheEntry * getCacheEntry(Oid foreigntableid);
+
+/* Hash table mapping oid to fdw instances */
+extern PGDLLIMPORT HTAB *InstancesHash;
 
 
 /* query.c */

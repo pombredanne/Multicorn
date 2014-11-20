@@ -90,11 +90,18 @@ initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta)
 	for (i = 0; i < attinmeta->tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = attinmeta->tupdesc->attrs[i];
+		Oid			outfuncoid;
+		bool		typIsVarlena;
+
+
 
 		if (!attr->attisdropped)
 		{
 			ConversionInfo *cinfo = palloc0(sizeof(ConversionInfo));
 
+			cinfo->attoutfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+			getTypeOutputInfo(attr->atttypid, &outfuncoid, &typIsVarlena);
+			fmgr_info(outfuncoid, cinfo->attoutfunc);
 			cinfo->atttypoid = attr->atttypid;
 			cinfo->atttypmod = attinmeta->atttypmods[i];
 			cinfo->attioparam = attinmeta->attioparams[i];
@@ -210,16 +217,16 @@ canonicalOpExpr(OpExpr *opExpr, Relids base_relids)
 		l = unnestClause(list_nth(opExpr->args, 0));
 		r = unnestClause(list_nth(opExpr->args, 1));
 		swapOperandsAsNeeded(&l, &r, &operatorid, base_relids);
-	}
-	if (IsA(l, Var) &&bms_is_member(((Var *) l)->varno, base_relids)
-		&& ((Var *) l)->varattno >= 1)
-	{
-		result = (OpExpr *) make_opclause(operatorid,
-										  opExpr->opresulttype,
-										  opExpr->opretset,
-										  (Expr *) l, (Expr *) r,
-										  opExpr->opcollid,
-										  opExpr->inputcollid);
+		if (IsA(l, Var) &&bms_is_member(((Var *) l)->varno, base_relids)
+			&& ((Var *) l)->varattno >= 1)
+		{
+			result = (OpExpr *) make_opclause(operatorid,
+											opExpr->opresulttype,
+											opExpr->opretset,
+											(Expr *) l, (Expr *) r,
+											opExpr->opcollid,
+											opExpr->inputcollid);
+		}
 	}
 	return result;
 }
@@ -247,7 +254,6 @@ canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr,
 	{
 		l = unnestClause(list_nth(opExpr->args, 0));
 		r = unnestClause(list_nth(opExpr->args, 1));
-		swapOperandsAsNeeded(&l, &r, &operatorid, base_relids);
 		tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(operatorid));
 		if (!HeapTupleIsValid(tp))
 			elog(ERROR, "cache lookup failed for operator %u", operatorid);
@@ -439,6 +445,7 @@ makeQual(AttrNumber varattno, char *opname, Expr *value, bool isarray,
 			qual->right_type = T_Const;
 			qual->typeoid = ((Const *) value)->consttype;
 			((MulticornConstQual *) qual)->value = ((Const *) value)->constvalue;
+			((MulticornConstQual *) qual)->isnull = ((Const *) value)->constisnull;
 			break;
 		case T_Var:
 			qual = palloc0(sizeof(MulticornVarQual));
@@ -449,6 +456,7 @@ makeQual(AttrNumber varattno, char *opname, Expr *value, bool isarray,
 			qual = palloc0(sizeof(MulticornParamQual));
 			qual->right_type = T_Param;
 			((MulticornParamQual *) qual)->expr = value;
+			qual->typeoid = InvalidOid;
 			break;
 	}
 	qual->varattno = varattno;
@@ -521,7 +529,7 @@ findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int start
 		List	   *item = lfirst(lc);
 		List	   *attrnos = linitial(item);
 		ListCell   *attno_lc;
-		int			nbrows = lsecond_int(item);
+		int			nbrows = ((Const *) lsecond(item))->constvalue;
 		List	   *allclauses = NULL;
 		Bitmapset  *outer_relids = NULL;
 

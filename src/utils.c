@@ -14,6 +14,7 @@
  */
 #include <Python.h>
 #include "postgres.h"
+#include "multicorn.h"
 
 
 struct module_state
@@ -42,23 +43,25 @@ log_to_postgres(PyObject *self, PyObject *args, PyObject *kwargs)
 
 	if (!PyArg_ParseTuple(args, "O|i", &p_message, &level))
 	{
+		errorCheck();
 		Py_INCREF(Py_None);
 		return Py_None;
 	}
 	if (PyBytes_Check(p_message))
 	{
-		message = strdup(PyBytes_AsString(p_message));
+		message = PyBytes_AsString(p_message);
 	}
 	else if (PyUnicode_Check(p_message))
 	{
-
-		message = PyUnicode_AsPgString(p_message);
+		message = strdup(PyUnicode_AsPgString(p_message));
 	}
 	else
 	{
+
 		PyObject   *temp = PyObject_Str(p_message);
 
-		message = PyUnicode_AsPgString(temp);
+		errorCheck();
+		message = strdup(PyString_AsString(temp));
 		errorCheck();
 		Py_DECREF(temp);
 	}
@@ -92,25 +95,22 @@ log_to_postgres(PyObject *self, PyObject *args, PyObject *kwargs)
 		{
 			hintstr = PyString_AsString(hint);
 			errhint("%s", hintstr);
-			Py_DECREF(hint);
 		}
 		if (detail != NULL && detail != Py_None)
 		{
 			detailstr = PyString_AsString(detail);
 			errdetail("%s", detailstr);
-			Py_DECREF(detail);
 		}
 		Py_DECREF(args);
 		Py_DECREF(kwargs);
-		Py_INCREF(Py_None);
 		errfinish(0);
 	}
 	else
 	{
 		Py_DECREF(args);
 		Py_DECREF(kwargs);
-		Py_INCREF(Py_None);
 	}
+	Py_INCREF(Py_None);
 	return Py_None;
 }
 
@@ -149,10 +149,10 @@ init_utils(void)
 #else
 	PyObject   *module = Py_InitModule("multicorn._utils", UtilsMethods);
 #endif
-
+	struct module_state *st;
 	if (module == NULL)
 		INITERROR;
-	struct module_state *st = GETSTATE(module);
+	st = GETSTATE(module);
 
 #if PY_MAJOR_VERSION >= 3
 	return module;

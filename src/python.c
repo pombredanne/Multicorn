@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "multicorn.h"
 #include "catalog/pg_user_mapping.h"
+#include "access/reloptions.h"
 #include "miscadmin.h"
 #include "utils/numeric.h"
 #include "utils/date.h"
@@ -12,9 +13,12 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/rel.h"
+#include "utils/rel.h"
 #include "executor/nodeSubplan.h"
 #include "bytesobject.h"
 #include "mb/pg_wchar.h"
+#include "access/xact.h"
+#include "utils/lsyscache.h"
 
 
 List	   *getOptions(Oid foreigntableid);
@@ -27,7 +31,7 @@ bool		compareColumns(List *columns1, List *columns2);
 PyObject   *getClass(PyObject *className);
 PyObject   *valuesToPySet(List *targetlist);
 PyObject   *qualDefsToPyList(List *quallist, ConversionInfo ** cinfo);
-PyObject *pythonQual(char *operatorname, Datum dvalue,
+PyObject *pythonQual(char *operatorname, PyObject *value,
 		   ConversionInfo * cinfo,
 		   bool is_array,
 		   bool use_or,
@@ -51,8 +55,10 @@ PyObject   *datumNumberToPython(Datum node, ConversionInfo * cinfo);
 PyObject   *datumDateToPython(Datum datum, ConversionInfo * cinfo);
 PyObject   *datumTimestampToPython(Datum datum, ConversionInfo * cinfo);
 PyObject   *datumIntToPython(Datum datum, ConversionInfo * cinfo);
-PyObject   *datumArrayToPython(Datum datum, ConversionInfo * cinfo);
+PyObject   *datumArrayToPython(Datum datum, Oid type, ConversionInfo * cinfo);
 PyObject   *datumByteaToPython(Datum datum, ConversionInfo * cinfo);
+PyObject   *datumUnknownToPython(Datum datum, ConversionInfo * cinfo, Oid type);
+
 
 void pythonDictToTuple(PyObject *p_value,
 				  TupleTableSlot *slot,
@@ -89,19 +95,13 @@ void appendBinaryStringInfoQuote(StringInfo buffer,
 							Py_ssize_t strlength,
 							bool need_quote);
 
-/* Hash table mapping oid to fdw instances */
-static HTAB *InstancesHash;
+UserMapping *
+			multicorn_GetUserMapping(Oid userid, Oid serverid);
 
-typedef struct CacheEntry
-{
-	Oid			hashkey;
-	PyObject   *value;
-	List	   *options;
-	List	   *columns;
-	/* Keep the "options" and "columns" in a specific context to avoid leaks. */
-	MemoryContext cacheContext;
-}	CacheEntry;
 
+
+
+static void begin_remote_xact(CacheEntry * entry);
 
 /*
  * Get a (python) encoding name for an attribute.
@@ -118,16 +118,21 @@ getPythonEncodingName()
 	return encoding_name;
 }
 
-
 char *
 PyUnicode_AsPgString(PyObject *p_unicode)
 {
-	Py_ssize_t	unicode_size = PyUnicode_GET_SIZE(p_unicode);
+	Py_ssize_t	unicode_size;
 	char	   *message = NULL;
-	PyObject   *pTempStr = PyUnicode_Encode(PyUnicode_AsUnicode(p_unicode),
-											unicode_size,
-											GetDatabaseEncodingName(), NULL);
+	PyObject   *pTempStr;
 
+	if (p_unicode == NULL)
+	{
+		elog(ERROR, "Received a null pointer in pyunicode_aspgstring");
+	}
+	unicode_size = PyUnicode_GET_SIZE(p_unicode);
+	pTempStr = PyUnicode_Encode(PyUnicode_AsUnicode(p_unicode),
+								unicode_size,
+								GetDatabaseEncodingName(), NULL);
 	errorCheck();
 	message = strdup(PyBytes_AsString(pTempStr));
 	errorCheck();
@@ -173,10 +178,11 @@ PyString_FromString(const char *s)
 char *
 PyString_AsString(PyObject *unicode)
 {
+	char	   *rv;
 	PyObject   *o = PyUnicode_AsEncodedString(unicode, GetDatabaseEncodingName(), NULL);
-	errorCheck();
-	char	   *rv = pstrdup(PyBytes_AsString(o));
 
+	errorCheck();
+	rv = pstrdup(PyBytes_AsString(o));
 	Py_XDECREF(o);
 	return rv;
 }
@@ -184,9 +190,11 @@ PyString_AsString(PyObject *unicode)
 int
 PyString_AsStringAndSize(PyObject *obj, char **buffer, Py_ssize_t *length)
 {
-	PyObject *o;
-	int rv;
-	if (PyUnicode_Check(obj)) {
+	PyObject   *o;
+	int			rv;
+
+	if (PyUnicode_Check(obj))
+	{
 		o = PyUnicode_AsEncodedString(obj, GetDatabaseEncodingName(), NULL);
 		errorCheck();
 		rv = PyBytes_AsStringAndSize(o, buffer, length);
@@ -319,7 +327,6 @@ getOptions(Oid foreigntableid)
 	ForeignServer *f_server;
 	UserMapping *mapping;
 	List	   *options;
-	MemoryContext savedContext = CurrentMemoryContext;
 
 	f_table = GetForeignTable(foreigntableid);
 	f_server = GetForeignServer(f_table->serverid);
@@ -329,20 +336,58 @@ getOptions(Oid foreigntableid)
 	options = list_concat(options, f_server->options);
 	/* An error might occur if no user mapping is defined. */
 	/* In that case, just ignore it */
-	PG_TRY();
-	{
-		mapping = GetUserMapping(GetUserId(), f_table->serverid);
+	mapping = multicorn_GetUserMapping(GetUserId(), f_table->serverid);
+	if (mapping)
 		options = list_concat(options, mapping->options);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-		MemoryContextSwitchTo(savedContext);
-		/* DO NOTHING HERE */
-	}
-	PG_END_TRY();
 	return options;
 }
+
+/*
+ * Reimplementation of GetUserMapping, which returns NULL instead of throwing an
+ * error when the mapping is not found.
+ */
+UserMapping *
+multicorn_GetUserMapping(Oid userid, Oid serverid)
+{
+	Datum		datum;
+	HeapTuple	tp;
+	bool		isnull;
+	UserMapping *um;
+
+	tp = SearchSysCache2(USERMAPPINGUSERSERVER,
+						 ObjectIdGetDatum(userid),
+						 ObjectIdGetDatum(serverid));
+
+	if (!HeapTupleIsValid(tp))
+	{
+		/* Not found for the specific user -- try PUBLIC */
+		tp = SearchSysCache2(USERMAPPINGUSERSERVER,
+							 ObjectIdGetDatum(InvalidOid),
+							 ObjectIdGetDatum(serverid));
+	}
+
+	if (!HeapTupleIsValid(tp))
+		return NULL;
+
+	um = (UserMapping *) palloc(sizeof(UserMapping));
+	um->userid = userid;
+	um->serverid = serverid;
+
+	/* Extract the umoptions */
+	datum = SysCacheGetAttr(USERMAPPINGUSERSERVER,
+							tp,
+							Anum_pg_user_mapping_umoptions,
+							&isnull);
+	if (isnull)
+		um->options = NIL;
+	else
+		um->options = untransformRelOptions(datum);
+
+	ReleaseSysCache(tp);
+
+	return um;
+}
+
 
 /*
  * Collect and validate options.
@@ -411,8 +456,8 @@ getColumnsFromTable(TupleDesc desc, PyObject **p_columns, List **columns)
 		int			i;
 		PyObject   *p_columnclass = getClassString("multicorn."
 												   "ColumnDefinition"),
-				*p_collections = PyImport_ImportModule("collections"),
-				*p_dictclass = PyObject_GetAttrString(p_collections, "OrderedDict");
+				   *p_collections = PyImport_ImportModule("collections"),
+				   *p_dictclass = PyObject_GetAttrString(p_collections, "OrderedDict");
 
 		columns_dict = PyObject_CallFunction(p_dictclass, "()");
 
@@ -443,8 +488,10 @@ getColumnsFromTable(TupleDesc desc, PyObject **p_columns, List **columns)
 
 				errorCheck();
 				columnDef = lappend(columnDef, makeString(key));
-				columnDef = lappend_oid(columnDef, typOid);
-				columnDef = lappend_oid(columnDef, typmod);
+				columnDef = lappend(columnDef, makeConst(TYPEOID,
+								   -1, InvalidOid, -1, typOid, false, true));
+				columnDef = lappend(columnDef, makeConst(TYPEOID,
+								   -1, InvalidOid, -1, typmod, false, true));
 				columnDef = lappend(columnDef, options);
 				columns_list = lappend(columns_list, columnDef);
 				PyMapping_SetItemString(columns_dict, key, column);
@@ -488,14 +535,14 @@ compareColumns(List *columns1, List *columns2)
 		cell1 = lnext(cell1);
 		cell2 = lnext(cell2);
 		/* Compare typoid */
-		if (lfirst_oid(cell1) != lfirst_oid(cell2))
+		if (((Const *) (lfirst(cell1)))->constvalue != ((Const *) lfirst(cell2))->constvalue)
 		{
 			return false;
 		}
 		cell1 = lnext(cell1);
 		cell2 = lnext(cell2);
 		/* Compare typmod */
-		if (lfirst_oid(cell1) != lfirst_oid(cell2))
+		if (((Const *) (lfirst(cell1)))->constvalue != ((Const *) lfirst(cell2))->constvalue)
 		{
 			return false;
 		}
@@ -511,13 +558,8 @@ compareColumns(List *columns1, List *columns2)
 }
 
 
-/*
- * Returns the fdw_instance associated with the foreigntableid.
- *
- * For performance reasons, it is cached in hash table.
- */
-PyObject *
-getInstance(Oid foreigntableid)
+CacheEntry *
+getCacheEntry(Oid foreigntableid)
 {
 	/*
 	 * create a temporary context. If we have to (re)create the python
@@ -540,21 +582,6 @@ getInstance(Oid foreigntableid)
 	TupleDesc	desc = rel->rd_att;
 	bool		needInitialization = false;
 
-	/* Initialize hash table if needed. */
-	if (InstancesHash == NULL)
-	{
-		HASHCTL		ctl;
-
-		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(CacheEntry);
-		ctl.hash = oid_hash;
-		ctl.hcxt = CacheMemoryContext;
-		InstancesHash = hash_create("multicorn instances", 32,
-									&ctl,
-									HASH_ELEM | HASH_FUNCTION);
-	}
-
 	entry = hash_search(InstancesHash, &foreigntableid, HASH_ENTER,
 						&found);
 
@@ -563,6 +590,7 @@ getInstance(Oid foreigntableid)
 		entry->options = NULL;
 		entry->columns = NULL;
 		entry->cacheContext = NULL;
+		entry->xact_depth = 0;
 		needInitialization = true;
 	}
 	else
@@ -571,7 +599,7 @@ getInstance(Oid foreigntableid)
 		if (!compareOptions(entry->options, options))
 		{
 			/* Options have changed, we must purge the cache. */
-			Py_DECREF(entry->value);
+			Py_XDECREF(entry->value);
 			needInitialization = true;
 		}
 		else
@@ -580,12 +608,12 @@ getInstance(Oid foreigntableid)
 			getColumnsFromTable(desc, &p_columns, &columns);
 			if (!compareColumns(columns, entry->columns))
 			{
-				Py_DECREF(entry->value);
+				Py_XDECREF(entry->value);
 				needInitialization = true;
 			}
 			else
 			{
-				Py_DECREF(p_columns);
+				Py_XDECREF(p_columns);
 			}
 		}
 	}
@@ -593,12 +621,15 @@ getInstance(Oid foreigntableid)
 	{
 		PyObject   *p_options = optionsListToPyDict(options),
 				   *p_class = getClass(PyDict_GetItemString(p_options,
-															"wrapper"));
+															"wrapper")),
+				   *p_instance;
 
+		entry->value = NULL;
 		getColumnsFromTable(desc, &p_columns, &columns);
 		PyDict_DelItemString(p_options, "wrapper");
-		entry->value = PyObject_CallFunction(p_class, "(O,O)", p_options,
-											 p_columns);
+		p_instance = PyObject_CallFunction(p_class, "(O,O)", p_options,
+										   p_columns);
+		errorCheck();
 		/* Cleanup the old context, containing the old columns and options */
 		/* values */
 		if (entry->cacheContext != NULL)
@@ -610,20 +641,67 @@ getInstance(Oid foreigntableid)
 		entry->cacheContext = tempContext;
 		entry->options = options;
 		entry->columns = columns;
+		entry->xact_depth = 0;
 		Py_DECREF(p_class);
 		Py_DECREF(p_options);
 		Py_DECREF(p_columns);
 		errorCheck();
+		entry->value = p_instance;
+		MemoryContextSwitchTo(oldContext);
 	}
 	else
 	{
+		MemoryContextSwitchTo(oldContext);
 		MemoryContextDelete(tempContext);
 	}
 	RelationClose(rel);
 	Py_INCREF(entry->value);
-	MemoryContextSwitchTo(oldContext);
-	return entry->value;
+
+	/*
+	 * Start a new transaction or subtransaction if needed.
+	 */
+	begin_remote_xact(entry);
+	return entry;
 }
+
+
+/*
+ * Returns the fdw_instance associated with the foreigntableid.
+ *
+ * For performance reasons, it is cached in hash table.
+ */
+PyObject *
+getInstance(Oid foreigntableid)
+{
+	return getCacheEntry(foreigntableid)->value;
+}
+
+
+static void
+begin_remote_xact(CacheEntry * entry)
+{
+	int			curlevel = GetCurrentTransactionNestLevel();
+	PyObject   *rv;
+
+	/* Start main transaction if we haven't yet */
+	if (entry->xact_depth <= 0)
+	{
+		rv = PyObject_CallMethod(entry->value, "begin", "(i)", IsolationIsSerializable());
+		Py_XDECREF(rv);
+		errorCheck();
+		entry->xact_depth = 1;
+	}
+
+	while (entry->xact_depth < curlevel)
+	{
+		entry->xact_depth++;
+		rv = PyObject_CallMethod(entry->value, "sub_begin", "(i)", entry->xact_depth);
+		Py_XDECREF(rv);
+		errorCheck();
+	}
+}
+
+
 
 /*
  * Returns the relation estimated size, in term of number of rows and width.
@@ -648,6 +726,13 @@ getRelSize(MulticornPlanState * state,
 	p_rows_and_width = PyObject_CallMethod(state->fdw_instance, "get_rel_size",
 										   "(O,O)", p_quals, p_targets_set);
 	errorCheck();
+	Py_DECREF(p_targets_set);
+	Py_DECREF(p_quals);
+	if ((p_rows_and_width == Py_None) || PyTuple_Size(p_rows_and_width) != 2)
+	{
+		Py_DECREF(p_rows_and_width);
+		elog(ERROR, "The get_rel_size python method should return a tuple of length 2");
+	}
 	p_rows = PyNumber_Long(PyTuple_GetItem(p_rows_and_width, 0));
 	p_width = PyNumber_Long(PyTuple_GetItem(p_rows_and_width, 1));
 	p_startup_cost = PyNumber_Long(
@@ -658,8 +743,6 @@ getRelSize(MulticornPlanState * state,
 	Py_DECREF(p_rows);
 	Py_DECREF(p_width);
 	Py_DECREF(p_rows_and_width);
-	Py_DECREF(p_targets_set);
-	Py_DECREF(p_quals);
 }
 
 PyObject *
@@ -672,33 +755,56 @@ qualdefToPython(MulticornConstQual * qualdef, ConversionInfo ** cinfos)
 				use_or = qualdef->base.useOr;
 	Oid			typeoid = qualdef->base.typeoid;
 	Datum		value = qualdef->value;
+	PyObject   *p_value;
+
+	if (qualdef->isnull)
+	{
+		p_value = Py_None;
+		Py_INCREF(Py_None);
+	}
+	else
+	{
+		if (typeoid == InvalidOid)
+		{
+			typeoid = cinfo->atttypoid;
+		}
+		p_value = datumToPython(value, typeoid, cinfo);
+		if (p_value == NULL)
+		{
+			return NULL;
+		}
+	}
 
 	if (typeoid <= 0)
 	{
 		typeoid = cinfo->atttypoid;
 	}
 
-	return pythonQual(operatorname, value,
+	return pythonQual(operatorname, p_value,
 					  cinfo, is_array, use_or, typeoid);
 }
 
 
 PyObject *
-pythonQual(char *operatorname, Datum dvalue,
+pythonQual(char *operatorname,
+		   PyObject *value,
 		   ConversionInfo * cinfo,
 		   bool is_array,
 		   bool use_or,
 		   Oid typeoid)
 {
-	PyObject   *value = datumToPython(dvalue, typeoid,
-									  cinfo),
-			   *qualClass = getClassString("multicorn.Qual"),
+	PyObject   *qualClass = getClassString("multicorn.Qual"),
 			   *qualInstance,
-			   *operator;
+			   *p_operatorname,
+			   *operator,
+			   *columnName;
 
+	p_operatorname = PyUnicode_Decode(operatorname, strlen(operatorname), getPythonEncodingName(), NULL);
+	errorCheck();
 	if (is_array)
 	{
 		PyObject   *arrayOpType;
+
 
 		if (use_or)
 		{
@@ -708,21 +814,25 @@ pythonQual(char *operatorname, Datum dvalue,
 		{
 			arrayOpType = Py_False;
 		}
-		operator = Py_BuildValue("(s, O)", operatorname, arrayOpType);
-
+		operator = Py_BuildValue("(O, O)", p_operatorname, arrayOpType);
+		Py_DECREF(p_operatorname);
+		errorCheck();
 	}
 	else
 	{
-
-		operator = PyString_FromString(operatorname);
+		operator = p_operatorname;
 	}
-	qualInstance = PyObject_CallFunction(qualClass, "(s,O,O)",
-										 cinfo->attrname,
+
+	columnName = PyUnicode_Decode(cinfo->attrname, strlen(cinfo->attrname), getPythonEncodingName(), NULL);
+	qualInstance = PyObject_CallFunction(qualClass, "(O,O,O)",
+										 columnName,
 										 operator,
 										 value);
+	errorCheck();
 	Py_DECREF(value);
 	Py_DECREF(operator);
 	Py_DECREF(qualClass);
+	Py_DECREF(columnName);
 	return qualInstance;
 }
 
@@ -761,6 +871,7 @@ execute(ForeignScanState *node)
 				newqual->base.useOr = qual->useOr;
 				newqual->value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
 				newqual->base.typeoid = qual->typeoid;
+				newqual->isnull = isNull;
 				break;
 			case T_Const:
 				newqual = (MulticornConstQual *) qual;
@@ -1034,10 +1145,7 @@ pythonDictToTuple(PyObject *p_value,
 			values[i] = (Datum) NULL;
 			nulls[i] = true;
 		}
-		if (p_object != NULL)
-		{
-			Py_DECREF(p_object);
-		}
+		Py_XDECREF(p_object);
 	}
 }
 
@@ -1154,6 +1262,25 @@ datumStringToPython(Datum datum, ConversionInfo * cinfo)
 }
 
 PyObject *
+datumUnknownToPython(Datum datum, ConversionInfo * cinfo, Oid type)
+{
+	char	   *temp;
+	ssize_t		size;
+	PyObject   *result;
+	Oid			outfuncoid;
+	bool		isvarlena;
+	FmgrInfo   *fmout = palloc0(sizeof(FmgrInfo));
+
+	getTypeOutputInfo(type, &outfuncoid, &isvarlena);
+	fmgr_info(outfuncoid, fmout);
+	temp = OutputFunctionCall(fmout, datum);
+	size = strlen(temp);
+	result = PyUnicode_Decode(temp, size, getPythonEncodingName(), NULL);
+	pfree(fmout);
+	return result;
+}
+
+PyObject *
 datumNumberToPython(Datum datum, ConversionInfo * cinfo)
 {
 	ssize_t		numvalue = (ssize_t) DatumGetNumeric(datum);
@@ -1213,7 +1340,7 @@ datumIntToPython(Datum datum, ConversionInfo * cinfo)
 }
 
 PyObject *
-datumArrayToPython(Datum datum, ConversionInfo * cinfo)
+datumArrayToPython(Datum datum, Oid type, ConversionInfo * cinfo)
 {
 	ArrayIterator iterator = array_create_iterator(DatumGetArrayTypeP(datum),
 												   0);
@@ -1230,7 +1357,18 @@ datumArrayToPython(Datum datum, ConversionInfo * cinfo)
 		}
 		else
 		{
-			pyitem = datumToPython(elem, cinfo->atttypoid, cinfo);
+			HeapTuple	tuple;
+			Form_pg_type typeStruct;
+			tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+			if (!HeapTupleIsValid(tuple))
+			{
+				elog(ERROR, "lookup failed for type %u",
+					 type);
+			}
+			typeStruct = (Form_pg_type) GETSTRUCT(tuple);
+			pyitem = datumToPython(elem, typeStruct->typelem, cinfo);
+			ReleaseSysCache(tuple);
+
 			PyList_Append(result, pyitem);
 			Py_DECREF(pyitem);
 		}
@@ -1245,6 +1383,7 @@ datumByteaToPython(Datum datum, ConversionInfo * cinfo)
 	text	   *txt = DatumGetByteaP(datum);
 	char	   *str = VARDATA(txt);
 	size_t		size = VARSIZE(txt) - VARHDRSZ;
+
 #if PY_MAJOR_VERSION >= 3
 	return PyBytes_FromStringAndSize(str, size);
 #else
@@ -1259,11 +1398,6 @@ datumToPython(Datum datum, Oid type, ConversionInfo * cinfo)
 	HeapTuple	tuple;
 	Form_pg_type typeStruct;
 
-	if (!datum)
-	{
-		Py_INCREF(Py_None);
-		return Py_None;
-	}
 	switch (type)
 	{
 		case BYTEAOID:
@@ -1292,10 +1426,9 @@ datumToPython(Datum datum, Oid type, ConversionInfo * cinfo)
 			if ((typeStruct->typelem != 0) && (typeStruct->typlen == -1))
 			{
 				/* Its an array. */
-				return datumArrayToPython(datum, cinfo);
+				return datumArrayToPython(datum, type, cinfo);
 			}
-			/* Defaults to NULL */
-			return NULL;
+			return datumUnknownToPython(datum, cinfo, type);
 	}
 }
 
@@ -1350,7 +1483,8 @@ pathKeys(MulticornPlanState * state)
 			Py_DECREF(p_key);
 		}
 		item = lappend(item, attnums);
-		item = lappend_int(item, rows);
+		item = lappend(item, makeConst(INT4OID,
+									 -1, InvalidOid, -1, rows, false, true));
 		result = lappend(result, item);
 		Py_DECREF(p_keys);
 		Py_DECREF(p_cost);
@@ -1409,6 +1543,7 @@ getRowIdColumn(PyObject *fdw_instance)
 	errorCheck();
 	if (value == Py_None)
 	{
+		Py_DECREF(value);
 		elog(ERROR, "This FDW does not support the writable API");
 	}
 	result = PyString_AsString(value);
