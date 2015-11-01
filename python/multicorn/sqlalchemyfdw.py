@@ -1,6 +1,122 @@
-"""A SQLAlchemy foreign data wrapper"""
+"""
+Purpose
+-------
 
-from . import ForeignDataWrapper
+This fdw can be used to access data stored in a remote RDBMS.
+Through the use of sqlalchemy, many different rdbms engines are supported.
+
+.. api_compat::
+    :read:
+    :write:
+    :transaction:
+    :import_schema:
+
+
+Dependencies
+------------
+
+You will need the `sqlalchemy`_ library, as well as a suitable dbapi driver for
+the remote database.
+
+You can find a list of supported RDBMs, and their associated dbapi drivers and
+connection strings in the `sqlalchemy dialects documentation`_.
+
+.. _sqlalchemy dialects documentation: http://docs.sqlalchemy.org/en/latest/dialects/
+
+.. _sqlalchemy: http://www.sqlalchemy.org/
+
+Connection options
+~~~~~~~~~~~~~~~~~~
+
+Connection options can be passed either with a db-url, or with a combination of
+individual connection parameters.
+If both a ``db_url`` and individual parameters are used, the parameters will override
+the value found in the ``db_url``.
+In both cases, at least the ``drivername`` should be passed, either as the url scheme in
+the ``db_url`` or using the ``drivername`` parameter.
+
+``db_url``
+  An sqlalchemy connection string.
+  Examples:
+
+    - mysql: `mysql://<user>:<password>@<host>/<dbname>`
+    - mssql: `mssql://<user>:<password>@<dsname>`
+
+  See the `sqlalchemy dialects documentation`_. for documentation.
+
+``username``
+  The remote username.
+
+``password``
+  The remote password
+
+``host``
+  The remote host
+
+``database``
+  The remote database
+
+``port``
+  The remote port
+
+
+Other options
+---------------
+
+``tablename`` (required)
+  The table name in the remote RDBMS.
+
+``primary_key``
+  Identifies a column which is a primary key in the remote RDBMS.
+  This options is required for INSERT, UPDATE and DELETE operations
+
+``schema``
+  The schema in which this table resides on the remote side
+
+When defining the table, the local column names will be used to retrieve the
+remote column data.
+Moreover, the local column types will be used to interpret the results in the
+remote table. Sqlalchemy being aware of the differences between database
+implementations, it will convert each value from the remote database to python
+using the converter inferred from the column type, and convert it back to a
+postgresql suitable form.
+
+What does it do to reduce the amount of fetched data ?
+------------------------------------------------------
+
+- `quals` are pushed to the remote database whenever possible. This include
+  simple operators :
+
+    - equality, inequality (=, <>, >, <, <=, >=)
+    - like, ilike and their negations
+    - IN clauses with scalars, = ANY (array)
+    - NOT IN clauses, != ALL (array)
+- the set of needed columns is pushed to the remote_side, and only those columns
+  will be fetched.
+
+Usage example
+-------------
+
+For a connection to a remote mysql database (you'll need a mysql dbapi driver,
+such as pymysql):
+
+.. code-block:: sql
+
+  CREATE SERVER alchemy_srv foreign data wrapper multicorn options (
+      wrapper 'multicorn.sqlalchemyfdw.SqlAlchemyFdw'
+  );
+
+  create foreign table mysql_table (
+    column1 integer,
+    column2 varchar
+  ) server alchemy_srv options (
+    tablename 'table',
+    db_url 'mysql://myuser:mypassword@myhost/mydb'
+  );
+
+"""
+
+from . import ForeignDataWrapper, TableDefinition, ColumnDefinition
 from .utils import log_to_postgres, ERROR, WARNING, DEBUG
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url, URL
@@ -12,7 +128,9 @@ except ImportError:
     from sqlalchemy import types as sqltypes
 
 from sqlalchemy.schema import Table, Column, MetaData
-from sqlalchemy.dialects.postgresql.base import ARRAY, ischema_names
+from sqlalchemy.dialects.oracle import base as oracle_dialect
+from sqlalchemy.dialects.postgresql.base import (
+    ARRAY, ischema_names, PGDialect, NUMERIC)
 import re
 import operator
 
@@ -31,6 +149,22 @@ def not_(function):
     return compose(operator.inv, function)
 
 
+def _parse_url_from_options(fdw_options):
+    if fdw_options.get('db_url'):
+        url = make_url(fdw_options.get('db_url'))
+    else:
+        if 'drivername' not in fdw_options:
+            log_to_postgres('Either a db_url, or drivername and other '
+                            'connection infos are needed', ERROR)
+        url = URL(fdw_options['drivername'])
+    for param in ('username', 'password', 'host',
+                    'database', 'port'):
+        if param in fdw_options:
+            setattr(url, param, fdw_options[param])
+    return url
+
+
+
 OPERATORS = {
     '=': operator.eq,
     '<': operator.lt,
@@ -44,6 +178,10 @@ OPERATORS = {
     '!~~': not_(sqlops.like_op),
     ('=', True): sqlops.in_op,
     ('<>', False): not_(sqlops.in_op)
+}
+
+CONVERSION_MAP = {
+    oracle_dialect.NUMBER: NUMERIC
 }
 
 
@@ -66,17 +204,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         if 'tablename' not in fdw_options:
             log_to_postgres('The tablename parameter is required', ERROR)
         self.metadata = MetaData()
-        if fdw_options.get('db_url'):
-            url = make_url(fdw_options.get('db_url'))
-        else:
-            if 'drivername' not in fdw_options:
-                log_to_postgres('Either a db_url, or drivername and other '
-                                'connection infos are needed', ERROR)
-            url = URL(fdw_options['drivername'])
-        for param in ('username', 'password', 'host',
-                      'database', 'port'):
-            if param in fdw_options:
-                setattr(url, param, fdw_options[param])
+        url = _parse_url_from_options(fdw_options)
         self.engine = create_engine(url)
         schema = fdw_options['schema'] if 'schema' in fdw_options else None
         tablename = fdw_options['tablename']
@@ -89,6 +217,8 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self.transaction = None
         self._connection = None
         self._row_id_column = fdw_options.get('primary_key', None)
+
+
 
     def execute(self, quals, columns):
         """
@@ -115,6 +245,11 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         rs = (self.connection
               .execution_options(stream_results=True)
               .execute(statement))
+        # Workaround pymssql "trash old results on new query"
+        # behaviour (See issue #100)
+        if self.engine.driver == 'pymssql' and self.transaction is not None:
+            rs = list(rs)
+
         for item in rs:
             yield dict(item)
 
@@ -229,3 +364,45 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         else:
             coltype = sqltypes.NULLTYPE
         return coltype
+
+    @classmethod
+    def import_schema(self, schema, srv_options, options,
+                      restriction_type, restricts):
+        """
+        Reflects the remote schema.
+        """
+        metadata = MetaData()
+        url = _parse_url_from_options(srv_options)
+        engine = create_engine(url)
+        dialect = PGDialect()
+        if restriction_type == 'limit':
+            only = restricts
+        elif restriction_type == 'except':
+            only = lambda t, _: t not in restricts
+        else:
+            only = None
+        metadata.reflect(bind=engine,
+                         schema=schema,
+                         only=only)
+        to_import = []
+        for _, table in sorted(metadata.tables.items()):
+            ftable = TableDefinition(table.name)
+            ftable.options['schema'] = schema
+            ftable.options['tablename'] = table.name
+            for c in table.c:
+                # Force collation to None to prevent imcompatibilities
+                setattr(c.type, "collation", None)
+                # If the type is specialized, call the generic
+                # superclass method
+                if type(c.type) in CONVERSION_MAP:
+                    class_name = CONVERSION_MAP[type(c.type)]
+                    old_args = c.type.__dict__
+                    c.type = class_name()
+                    c.type.__dict__.update(old_args)
+                if c.primary_key:
+                    ftable.options['primary_key'] = c.name
+                ftable.columns.append(ColumnDefinition(
+                    c.name,
+                    type_name=c.type.compile(dialect)))
+            to_import.append(ftable)
+        return to_import

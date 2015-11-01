@@ -22,7 +22,6 @@
 
 
 List	   *getOptions(Oid foreigntableid);
-PyObject   *optionsListToPyDict(List *options);
 bool		compareOptions(List *options1, List *options2);
 
 void		getColumnsFromTable(TupleDesc desc, PyObject **p_columns, List **columns);
@@ -37,7 +36,6 @@ PyObject *pythonQual(char *operatorname, PyObject *value,
 		   bool use_or,
 		   Oid typeoid);
 
-const char *getPythonEncodingName(void);
 
 
 
@@ -95,11 +93,6 @@ void appendBinaryStringInfoQuote(StringInfo buffer,
 							Py_ssize_t strlength,
 							bool need_quote);
 
-UserMapping *
-			multicorn_GetUserMapping(Oid userid, Oid serverid);
-
-
-
 
 static void begin_remote_xact(CacheEntry * entry);
 
@@ -132,7 +125,7 @@ PyUnicode_AsPgString(PyObject *p_unicode)
 	unicode_size = PyUnicode_GET_SIZE(p_unicode);
 	pTempStr = PyUnicode_Encode(PyUnicode_AsUnicode(p_unicode),
 								unicode_size,
-								GetDatabaseEncodingName(), NULL);
+								getPythonEncodingName(), NULL);
 	errorCheck();
 	message = strdup(PyBytes_AsString(pTempStr));
 	errorCheck();
@@ -412,6 +405,7 @@ optionsListToPyDict(List *options)
 	}
 	return p_options_dict;
 }
+
 
 bool
 compareOptions(List *options1, List *options2)
@@ -1171,6 +1165,11 @@ pythonSequenceToTuple(PyObject *p_value,
 			continue;
 		}
 		p_object = PySequence_GetItem(p_value, j);
+		if(p_object == NULL || p_object == Py_None){
+			nulls[i] = true;
+			values[i] = NULL;
+			continue;
+		}
 		resetStringInfo(buffer);
 		values[i] = pyobjectToDatum(p_object, buffer,
 									cinfos[cinfo_idx]);
@@ -1342,8 +1341,14 @@ datumIntToPython(Datum datum, ConversionInfo * cinfo)
 PyObject *
 datumArrayToPython(Datum datum, Oid type, ConversionInfo * cinfo)
 {
+#if PG_VERSION_NUM >= 90500
+	ArrayIterator iterator = array_create_iterator(DatumGetArrayTypeP(datum),
+												   0, NULL);
+# else
 	ArrayIterator iterator = array_create_iterator(DatumGetArrayTypeP(datum),
 												   0);
+# endif
+
 	Datum		elem = (Datum) NULL;
 	bool		isnull;
 	PyObject   *result = PyList_New(0),
@@ -1359,6 +1364,7 @@ datumArrayToPython(Datum datum, Oid type, ConversionInfo * cinfo)
 		{
 			HeapTuple	tuple;
 			Form_pg_type typeStruct;
+
 			tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
 			if (!HeapTupleIsValid(tuple))
 			{
@@ -1510,7 +1516,7 @@ tupleTableSlotToPyObject(TupleTableSlot *slot, ConversionInfo ** cinfos)
 		PyObject   *item;
 		AttrNumber	cinfo_idx = attr->attnum - 1;
 
-		if (attr->attisdropped)
+		if (attr->attisdropped || cinfos[cinfo_idx] == NULL)
 		{
 			continue;
 		}
@@ -1518,6 +1524,7 @@ tupleTableSlotToPyObject(TupleTableSlot *slot, ConversionInfo ** cinfos)
 		if (isnull)
 		{
 			item = Py_None;
+			Py_INCREF(item);
 		}
 		else
 		{

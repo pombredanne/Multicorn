@@ -400,19 +400,8 @@ NOTICE:  ['test1', 'test2']
  test1 3 19 | test2 1 19
 (20 rows)
 
-ALTER FOREIGN TABLE testmulticorn options (add test_type 'encoding');
-select * from testmulticorn limit 1;
-NOTICE:  [('option1', 'option1'), ('test_type', 'encoding'), ('usermapping', 'test')]
-NOTICE:  [('test1', 'character varying'), ('test2', 'character varying')]
-NOTICE:  []
-NOTICE:  ['test1', 'test2']
- test1 | test2 
--------+-------
- éà¤   | éà¤
-(1 row)
-
 -- Test that zero values are converted to zero and not null
-ALTER FOREIGN TABLE testmulticorn options (set test_type 'int');
+ALTER FOREIGN TABLE testmulticorn options (add test_type 'int');
 ALTER FOREIGN TABLE testmulticorn alter test1 type integer;
 select * from testmulticorn limit 1;
 NOTICE:  [('option1', 'option1'), ('test_type', 'int'), ('usermapping', 'test')]
@@ -480,9 +469,9 @@ NOTICE:  ['test1', 'test2', 'test3']
 SELECT * from testmulticorn where test1 = '12 €';
 ERROR:  Error in python: UnicodeDecodeError
 DETAIL:  'ascii' codec can't decode byte 0xe2 in position 3: ordinal not in range(128)
+DROP USER MAPPING FOR postgres SERVER multicorn_srv;
 DROP EXTENSION multicorn cascade;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to server multicorn_srv
-drop cascades to user mapping for postgres
 drop cascades to foreign table testmulticorn
 drop cascades to foreign table testmulticorn2
